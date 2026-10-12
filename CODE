@@ -1,39 +1,40 @@
 cat > README.md <<'MDEOF'
 # Data Analysis Agent
 
-An agent that takes **any tabular dataset** (CSV / TSV / Excel / JSON / Parquet) and answers natural-language questions about it by **calling its own analysis tools**, not by guessing. Claude decides which tool to use and chains them; the tools do the actual computation in pandas / SciPy / SQLite; the answer is grounded in the tool outputs. It also has **persistent memory**, so definitions, corrections, preferences and named filters you give it carry over to later sessions and change its future answers.
+An agent that takes **any tabular dataset** (CSV / TSV / Excel / JSON / Parquet) and answers natural-language questions about it by **calling its own analysis tools**, not by guessing. The agent decides which tool to use and chains them; the tools do the actual computation in pandas / SciPy / SQLite; the answer is grounded in the tool outputs. It also has **persistent memory**, so definitions, corrections, preferences and named filters you give it carry over to later sessions and change its future answers.
+you ──question──▶  DataAnalysisAgent (agent/agent.py)
+│  system prompt = dataset schema + relevant memories
+▼
+Agent (tool-use loop) ◀──────────────────────────────┐
+│ tool_use                                      │ tool_result (real numbers)
+▼                                               │
+DataSession.call()  (agent/tools.py)  ────────────────┘
+├─ describe_dataset      ├─ detect_outliers     ├─ remember
+├─ run_sql               ├─ statistical_test    ├─ list_memories
+├─ group_aggregate       ├─ time_trend          └─ forget
+├─ correlation_analysis  └─ make_chart   
 
-```
- you ──question──▶  DataAnalysisAgent (agent/agent.py)
-                        │  system prompt = dataset schema + relevant memories
-                        ▼
-                  Claude (tool-use loop) ◀──────────────────────────────┐
-                        │ tool_use                                      │ tool_result (real numbers)
-                        ▼                                               │
-                  DataSession.call()  (agent/tools.py)  ────────────────┘
-                  ├─ describe_dataset      ├─ detect_outliers     ├─ remember
-                  ├─ run_sql               ├─ statistical_test    ├─ list_memories
-                  ├─ group_aggregate       ├─ time_trend          └─ forget
-                  ├─ correlation_analysis  └─ make_chart                │
-                                                                        ▼
-                                                      MemoryStore (agent/memory.py) ─▶ memory.json
-```
+│
+▼
+MemoryStore (agent/memory.py) ─▶ memory.json 
+
 
 ## Quick start
+## Quick start
 
-Requires Python 3.10+ and an Anthropic API key.
+Requires Python 3.10+ and an API key.
 
-```bash
+bash
 git clone <your-repo-url> && cd data-analysis-agent
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...
-
+export API_KEY=your-api-key-here
 python -m agent.sample_data                       # writes data/customers.csv and data/employees.csv
 python -m agent.cli data/customers.csv            # interactive
 python -m agent.cli data/employees.csv -q "Is attrition related to overtime? Is the gap real?"
 python -m agent.cli path/to/YOUR_data.csv         # any CSV/XLSX/JSON/Parquet
-```
+
+
 
 Options: `--memory PATH` (memory file; default `~/.data_analysis_agent/memory.json`), `--no-memory`, `--model ID` (default `claude-sonnet-5-5`, or set `$DA_MODEL`), `--out-dir` (charts), `--max-steps N`, `--quiet` (hide tool trace), `--sheet` (Excel).
 Inside the interactive shell: `/schema`, `/memory`, `/forget <id>`, `/clear-memory`, `/help`, `/quit`.
