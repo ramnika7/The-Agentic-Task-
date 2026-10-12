@@ -1,0 +1,159 @@
+cat > README.md <<'MDEOF'
+# Data Analysis Agent
+
+An agent that takes **any tabular dataset** (CSV / TSV / Excel / JSON / Parquet) and answers natural-language questions about it by **calling its own analysis tools**, not by guessing. Claude decides which tool to use and chains them; the tools do the actual computation in pandas / SciPy / SQLite; the answer is grounded in the tool outputs. It also has **persistent memory**, so definitions, corrections, preferences and named filters you give it carry over to later sessions and change its future answers.
+
+```
+ you ──question──▶  DataAnalysisAgent (agent/agent.py)
+                        │  system prompt = dataset schema + relevant memories
+                        ▼
+                  Claude (tool-use loop) ◀──────────────────────────────┐
+                        │ tool_use                                      │ tool_result (real numbers)
+                        ▼                                               │
+                  DataSession.call()  (agent/tools.py)  ────────────────┘
+                  ├─ describe_dataset      ├─ detect_outliers     ├─ remember
+                  ├─ run_sql               ├─ statistical_test    ├─ list_memories
+                  ├─ group_aggregate       ├─ time_trend          └─ forget
+                  ├─ correlation_analysis  └─ make_chart                │
+                                                                        ▼
+                                                      MemoryStore (agent/memory.py) ─▶ memory.json
+```
+
+## Quick start
+
+Requires Python 3.10+ and an Anthropic API key.
+
+```bash
+git clone <your-repo-url> && cd data-analysis-agent
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=sk-ant-...
+
+python -m agent.sample_data                       # writes data/customers.csv and data/employees.csv
+python -m agent.cli data/customers.csv            # interactive
+python -m agent.cli data/employees.csv -q "Is attrition related to overtime? Is the gap real?"
+python -m agent.cli path/to/YOUR_data.csv         # any CSV/XLSX/JSON/Parquet
+```
+
+Options: `--memory PATH` (memory file; default `~/.data_analysis_agent/memory.json`), `--no-memory`, `--model ID` (default `claude-sonnet-5-5`, or set `$DA_MODEL`), `--out-dir` (charts), `--max-steps N`, `--quiet` (hide tool trace), `--sheet` (Excel).
+Inside the interactive shell: `/schema`, `/memory`, `/forget <id>`, `/clear-memory`, `/help`, `/quit`.
+
+**No API key? You can still see the tools work:** `python scripts/demo_tools.py` runs every tool on both sample datasets and writes the output to `docs/tool_demo_output.md` (plus charts in `docs/images/`). `python -m unittest discover -s tests -t .` (or `pytest`) runs the 36 tests, which need no key.
+
+## The tools (8 analysis + 3 memory)
+
+They are different *kinds* of analysis, not wrappers around one operation:
+
+| Tool | Kind of work | What it does |
+|---|---|---|
+| `describe_dataset` | Profiling | Schema, inferred column kinds, missingness, distinct counts, quantiles, top categories, date ranges, duplicate rows, sample rows |
+| `run_sql` | Ad-hoc querying | One read-only SQL statement (SQLite) over the table `data`: CASE, window functions, ratios, anything custom. Writes/multi-statements are rejected |
+| `group_aggregate` | Segmentation | Group-by with count/sum/mean/median/min/max/std/nunique, sorting, top-N, quantile-binning of numeric columns |
+| `correlation_analysis` | Association discovery | Top numeric pairs, or with `target=` ranks *every* column against it using the right measure per type pair: Pearson/Spearman r, correlation ratio η (categorical↔numeric), Cramér's V (categorical↔categorical). ID-like columns are skipped |
+| `detect_outliers` | Anomaly detection | IQR fences, z-score, or MAD; returns fences, counts, most extreme rows, and which groups they concentrate in |
+| `statistical_test` | Inference | Test chosen from column types: Welch t-test / one-way ANOVA (numeric vs categorical, plus a Mann-Whitney / Kruskal-Wallis robustness check), χ² + Cramér's V (categorical vs categorical), Pearson + Spearman with p-values (numeric vs numeric). Always reports an effect size and its magnitude |
+| `time_trend` | Time series | Resample (D/W/M/Q/Y), linear trend (slope, p, R²), first→last change, peak/trough, warns if the last period may be partial; optional trend per group |
+| `make_chart` | Visualisation | bar / line / hist / scatter / box to PNG, returns the path and the plotted values |
+| `remember` / `list_memories` / `forget` | Memory | See below |
+
+Every result includes `rows_used`, `of_total_rows` and `filter_applied`, so the model (and you) can see exactly which rows an answer was computed on. Errors are returned to the model as data (e.g. *"Unknown column 'agee'. Did you mean: ['age']?"*) so it can fix the call and retry.
+
+### What the tools produce (real output from `scripts/demo_tools.py`, synthetic data)
+
+- Cancellation rate by plan (`run_sql`): Free 29.4%, Enterprise 21.8%, Basic 18.7%, Pro 17.5%.
+- Do cancelled customers file more support tickets? (`statistical_test`): mean 2.10 vs 1.35, Welch p ≈ 1e-24, Cohen's d = −0.64 (medium), and the Mann-Whitney check agrees.
+- Signups per quarter (`time_trend`): significant upward trend (+19 signups/quarter), and the last quarter is flagged as possibly partial.
+- Attrition vs overtime (`statistical_test`, HR data): 22.4% of overtime staff left vs 9.5% of others, χ² p ≈ 2e-9, Cramér's V = 0.18 (small). Significant *and* small, which is why the prompt makes the model report effect size, not just p.
+- What drives salary? (`correlation_analysis`): `job_level` r = 0.73, `department` η = 0.26, `years_at_company` r = 0.14.
+
+## Why it answers accurately
+
+- The system prompt forbids stating any number that didn't come from a tool result in the conversation, and requires the answer to lead with the result, then evidence (rows used, filter), then caveats (missing data, small n, partial last period, correlation ≠ causation).
+- Computation is done by deterministic code. The LLM only chooses tools and explains results.
+- The agent loop caps tool-use steps (`--max-steps`, default 15) and truncates oversized tool results, telling the model to narrow the query.
+- Tool correctness is tested against independent pandas/SciPy calculations (see Testing).
+
+## Works on other datasets
+
+Nothing is hard-coded to a dataset. Column kinds (numeric / categorical / datetime) are inferred at load; date-like text columns are auto-parsed; column names are matched case/space-insensitively with "did you mean" hints; the schema summary in the prompt is generated from whatever file you load. The tests run the same tools on two differently shaped synthetic datasets (SaaS customers, HR attrition) plus a third ad-hoc frame with spaces in column names (`"Order Date"`, `"Item Price"`).
+
+## Memory design
+
+**What gets stored** (`agent/memory.py`): short, durable facts the *user states*, in five kinds: `definition` (what a term/column means), `filter` (a reusable named filter, stored as a pandas query), `correction` (a fix to the data or to an earlier answer), `preference` (e.g. weekly rather than daily summaries), `note`. Not stored: chat transcripts, query results, data. Values over 600 characters are rejected so the store can't be used as a data dump, and the prompt tells the model to save one short fact per call and only when the user states it.
+
+**Scoping.** Each entry is either global (preferences) or tied to the *columns of the dataset it was saved against*. It applies later only if the loaded dataset's columns overlap (Jaccard ≥ 0.5), so "active customers" from the customers file never leaks into the HR file, but still applies if the customers file gains a column.
+
+**Conflicts and updates.** Saving the same kind + key + scope again *updates* the entry in place and keeps the last 5 previous values as history (the tool reports `action: added | updated | unchanged` and the previous value). Contradicting a remembered definition therefore replaces it rather than accumulating two conflicting entries. Filters are validated against the dataset before saving, so a broken definition is rejected immediately.
+
+**Retrieval.** On each question, preferences and corrections always apply; definitions, filters and notes are injected only if the question overlaps with the entry's key or text (light stemming, stop-words removed). So "how many cancelled accounts?" retrieves *active customers* (its definition mentions "cancelled"), while "what's the average age?" does not. Usage counts and last-used time are tracked.
+
+**How it changes behaviour (not just the prompt).** Named filters are *executable*: every tool accepts `where="@active_customers"` (combinable, e.g. `@active_customers and plan == 'Pro'`), and the session substitutes the stored expression. So a remembered definition deterministically changes which rows every tool computes on, and is visible in `filter_applied`. Preferences and definitions are injected into the system prompt, with an instruction to apply them and say so.
+
+**Inspect and control.** The store is a readable JSON file. `/memory` lists everything (id, kind, value, scope, use count), `/forget <id>` and `/clear-memory` delete, and the model can call `list_memories` / `forget` when you ask. A corrupt file is backed up (`.corrupt.json`) instead of crashing or being overwritten.
+
+**Example flow** (steps 1–3 are exercised in `tests/test_agent_loop.py::test_memory_persists_and_changes_the_next_session` and step 4 in `test_user_correction_updates_the_stored_definition`, both with a scripted model):
+
+1. Session 1: *"Active customers means not cancelled. Count them by plan."* → model calls `remember(kind="filter", key="active customers", value="status != 'cancelled'")`, then `group_aggregate(..., where="@active_customers")`.
+2. Session 2 (new process, same memory file): *"How many active customers per region?"* → the definition is retrieved into the prompt and the tool call uses `@active_customers`: same row count, no re-explaining.
+3. Session 2: *"What's the average age?"* → the definition is not injected.
+4. *"Actually, active also excludes paused."* → `remember` with the same key updates the filter; later questions use the new definition.
+
+## Testing
+
+`python -m unittest discover -s tests -t .` runs 36 tests (also collected by `pytest`):
+
+- `test_tools.py`: every tool is checked against an independent pandas/SciPy calculation (e.g. SQL group means vs `groupby`, outlier counts vs a manual IQR, Welch statistic vs `scipy.stats.ttest_ind`, χ² vs `chi2_contingency`, correlations vs `DataFrame.corr`); SQL write attempts are rejected; charts are real PNGs; named filters apply and don't leak across datasets; an unseen dataset with different column names works.
+- `test_memory.py`: persistence across instances, update + history, scoping, selective retrieval, size limit, forget/clear, corrupt-file recovery.
+- `test_agent_loop.py`: the loop with a **scripted fake model**: tool results are fed back, errors are returned and can be retried, the step cap works, memory persists across "sessions" and changes tool behaviour.
+
+**What is not covered:** the tests do not measure model quality (tool choice, wording, whether it follows the memory rules), because that needs live API calls. The scripted-model tests verify the plumbing, not Claude's judgement. Try the CLI on your own data and questions; I'd treat that as the real evaluation.
+
+## Decisions and trade-offs
+
+- **Claude tool use via the raw SDK, no agent framework.** The loop is ~40 lines (`agent/agent.py`), easy to read and explain; the LLM client is injectable, which is how the loop is tested without a network.
+- **SQL *and* structured tools.** SQL covers the long tail; structured tools give the model reliable, validated building blocks for the common analyses (and statistics that are awkward in SQL: tests, trends, correlation ratios).
+- **Filters as pandas query strings.** Simple, inspectable and shared by all tools. Trade-off: filter strings that reference the same filter name in a quoted literal containing `@` would be misparsed; function-call patterns such as `eval(`/`open(` and dunder access are blocked. This is for a local analysis tool, not a hardened multi-tenant service.
+- **Heuristic memory retrieval (keyword overlap), not embeddings.** Predictable, dependency-free and testable for a handful of facts; it will miss paraphrases ("paying users" vs "active customers") that an embedding or LLM-based retriever would catch. The model can always call `list_memories`.
+- **Synthetic sample data.** The environment this was developed in had no internet access, so the demo datasets are generated with known injected effects (`agent/sample_data.py`), which also lets the tests verify the tools find real structure. Swap in any real file for evaluation.
+
+## Known limitations
+
+- The IQR rule flags a lot on skewed or mixed-population columns (on the customer data, 9.5% of `monthly_spend` because Enterprise is a different population); that's why `detect_outliers` supports `group_by` and other methods and the model is told to cross-check.
+- Tests assume independent rows; no multiple-comparison correction or time-series autocorrelation handling.
+- Large files are held in memory in pandas; very wide tables show only the first 60 columns in the prompt schema (use `describe_dataset`).
+- Developed and tested on Python 3.13 / pandas 3.0 / SciPy 1.18 / matplotlib 3.11. `requirements.txt` states pandas ≥ 2.2 (needed for the `ME`/`QE`/`YE` frequency aliases), but older versions were not tested.
+- Memory is a single local file with no locking; don't point two live sessions at it simultaneously.
+
+## What I used vs. what I built
+
+**External components:** Claude via the Anthropic Python SDK (reasoning and tool selection); pandas, NumPy, SciPy (computation and statistics); matplotlib (charts); SQLite via the Python standard library (`run_sql`); `unittest` (tests).
+
+**AI assistance:** this project was designed and written with Claude (through Claude Code) as a coding assistant.
+
+> **TODO (author), edit before submitting:** replace this note with your own account of what *you* did: the design decisions you made or changed, what you ran and verified yourself, what you learned or got wrong along the way. Evaluators ask you to explain the implementation, so read the code and be ready to walk through `agent/agent.py`, one or two tools, and the memory flow.
+
+## Project layout
+
+```
+agent/
+  agent.py        # tool-use loop, system prompt, memory retrieval hook
+  tools.py        # DataSession + all 11 tools + tool schemas
+  memory.py       # MemoryStore: scope, conflicts, retrieval, persistence
+  sample_data.py  # synthetic datasets with known effects
+  cli.py          # interactive / one-shot CLI
+scripts/demo_tools.py   # run all tools without an LLM -> docs/tool_demo_output.md
+tests/                  # 36 tests
+data/                   # generated sample CSVs
+docs/                   # demo output + charts
+```
+
+## Suggested 2-minute demo
+
+1. `python -m agent.cli data/customers.csv`: ask *"Which plan churns most, and is it significant?"* (watch the tool trace: `run_sql` → `statistical_test`).
+2. Say *"Active customers means status is not cancelled. Show spend by plan for active customers."* (`remember`, then `@active_customers`).
+3. `/memory`, then `/quit`, and restart the CLI: *"How many active customers do we have per region?"* The saved definition is applied automatically.
+4. Run it on a different file, e.g. `data/employees.csv`: *"What drives salary, and are there outliers?"*
+5. Correct the definition (*"actually, exclude paused too"*) and ask again.
+MDEOF
+
+echo "Block 4 done"
